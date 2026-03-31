@@ -294,9 +294,13 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         doc_buffer.extend(token_lists)
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
+    _use_cuda = torch.cuda.is_available()
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=_use_cuda)
+    if _use_cuda:
+        gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    else:
+        gpu_buffer = cpu_buffer  # alias: no copy needed on CPU
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
@@ -333,7 +337,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        if _use_cuda:
+            gpu_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -349,9 +354,12 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    _dev = "cuda" if torch.cuda.is_available() else "cpu"
+    token_bytes = get_token_bytes(device=_dev)
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    if not torch.cuda.is_available():
+        steps = min(steps, 20)  # cap eval steps on CPU for feasibility
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):
