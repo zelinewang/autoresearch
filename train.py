@@ -485,7 +485,7 @@ else:
     device = torch.device("cpu")
     autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
     from prepare import TIME_BUDGET as _TB_ORIG
-    TIME_BUDGET = min(_TB_ORIG, 120)  # cap at 2 min for CPU testing
+    TIME_BUDGET = min(_TB_ORIG, 300)  # match GPU time budget for meaningful experiments
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
