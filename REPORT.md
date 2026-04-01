@@ -134,15 +134,37 @@ This is a production-quality design choice — zero padding waste means every to
 
 ---
 
-## 4. Our Test Run (CPU Mode)
+## 4. Our Evaluation: Three Phases of Testing
 
-### Environment
+We tested autoresearch in three progressively deeper phases, each building on the previous one's findings. All testing was done on CPU (no GPU available), which means results are not directly comparable to the original H100 benchmarks — but the framework, patterns, and relative improvements are valid.
+
+```
+Phase 1: Pipeline Verification       → "Does it run on CPU at all?"
+         16 controlled experiments   → "Which parameters matter most?"
+         ↓
+Phase 2: Production Simulation       → "Does the experiment loop work at scale?"
+         300 experiments (3 tracks)  → "How does structured vs random search compare?"
+         ↓
+Phase 3: Real LLM-Driven Research    → "Does real-time LLM reasoning add value?"
+         20 experiments              → "Can the LLM discover things scripts can't?"
+```
+
+**Where to find full data:**
+- Phase 1: `serve/experiment_results.tsv` (16 rows, raw data)
+- Phase 2: `serve/EVALUATION_REPORT.md` (full analysis), `serve/production/` (309 experiment directories)
+- Phase 3: `results.tsv` on branch `autoresearch/apr1`, git log has every change
+
+---
+
+### Phase 1: Pipeline Verification & Parameter Sensitivity (Mar 31)
+
+#### Environment
 - **Machine**: web_dev (AWS EC2, no GPU)
 - **Python**: 3.10.19 (uv-managed)
 - **PyTorch**: 2.9.1+cu128 (CUDA libs installed but no GPU hardware)
 - **Status**: Full pipeline verified ✓
 
-### CPU Adaptations Made
+#### CPU Adaptations Made
 
 | Original (GPU) | CPU Adaptation | Why |
 |----------------|---------------|-----|
@@ -155,7 +177,7 @@ This is a production-quality design choice — zero padding waste means every to
 | `pin_memory=True` | Conditional | Only useful with CUDA |
 | `torch.cuda.synchronize()` | Guarded | No-op on CPU |
 
-### Results
+#### Results
 
 ```
 [CPU MODE] No NVIDIA GPU detected — using scaled_dot_product_attention fallback
@@ -184,31 +206,89 @@ Final:
 
 **Interpretation**: Loss dropped 33.6% (9.01 → 5.98) over 116 steps. The model is learning. val_bpb = 2.183 is expected for a tiny 2-layer model on a subset of data — the original 8-layer model on H100 achieves ~0.998.
 
+#### Phase 1 also ran 16 controlled parameter sweeps
+
+Using `run_experiments.py`, we systematically varied one parameter at a time (depth, time budget, batch size, learning rate) with fixed random seed 42 for reproducibility. All 16 experiments succeeded (zero crashes).
+
+**Key findings from 16 controlled experiments:**
+
+| Parameter | Range Tested | Impact on val_bpb | Most Important Finding |
+|-----------|-------------|-------------------|----------------------|
+| **Time budget** | 30s → 180s | 13.6% range | #1 most impactful parameter. More time = always better (diminishing returns). |
+| **Model depth** | 1 → 4 layers | 5.8% range | Deeper = worse on CPU (fewer steps in fixed time). depth=1 beats depth=4. |
+| **Batch size** | 1 → 8 | 4.7% range | batch=4 is sweet spot. Gradient quality > gradient quantity. |
+| **Learning rate** | 0.01 → 0.16 | 2.1% range | Least sensitive. MuonAdamW optimizer is naturally robust to LR changes. |
+
+**Phase 1 conclusion**: The framework works correctly on CPU. Time budget is the dominant parameter. The MuonAdamW optimizer's robustness to LR means hyperparameter tuning has limited upside — this is a key insight for evaluating autoresearch's value.
+
+> Full data: `serve/experiment_results.tsv`
+
 ---
 
-## 4b. LLM-Driven Autonomous Experiments (autoresearch/apr1)
+### Phase 2: Production-Scale Simulation — 300 Experiments (Mar 31–Apr 1)
+
+> **Goal**: Simulate the full autoresearch experiment loop at scale
+> **Method**: 3 parallel tracks × 100 experiments each, 5-minute training budget per experiment
+> **Key question**: Does structured search actually beat random search?
+
+Phase 2 used `production_test.py` to run 300 experiments across three tracks with different search strategies:
+
+| Track | Strategy | Starting Config | Purpose |
+|-------|----------|----------------|---------|
+| **Smart** | Ordered mutations (best→worst) | depth=2, batch=4 | Simulate "strategic search" |
+| **Diverse** | Shuffled mutations + different start | depth=1, batch=8 | Cross-validation |
+| **Random** | Pure random configurations | depth=2, batch=4 | Control group |
+
+100 pre-defined mutations covered 8 dimensions: depth (1-7), batch (1-32), matrix_lr, embedding_lr, weight_decay, window_pattern, warmup, warmdown.
+
+#### Results
+
+```
+Track      Experiments  Keeps   Keep Rate  Best val_bpb  Improvement  Crashes
+Smart      100          9       9%         2.0135        −4.59%       3
+Diverse    100          11      11%        2.0178        −3.90%       3
+Random     100          1       1%         2.1043        −0.34%       0
+─────────────────────────────────────────────────────────────────────
+Total      300          21      7%         2.0135        −4.59%       6
+```
+
+#### What this proves
+
+1. **Structured search >> Random search**: 9-11× higher keep rate, 13.5× more improvement. The search space has very sparse good configurations — random rarely finds them.
+
+2. **Two independent tracks converged on the same answer**: Both Smart and Diverse independently discovered `depth=1 + big batch + unembedding_lr=0.01` as the optimal direction. This cross-validation is strong evidence.
+
+3. **Framework is robust**: 98% success rate (294/300). All 6 crashes were deep models (depth ≥ 4) that timed out on CPU — the framework correctly handled these as failures and continued.
+
+4. **Search doesn't saturate at 100 rounds**: Smart track's last keep was experiment #99 (!). Improvements were spread across early, mid, and late experiments — not front-loaded.
+
+5. **Cumulative mutations can have negative interactions**: Smart #99 was a "reset to defaults" that *improved* val_bpb — meaning some accumulated changes were canceling each other out. This validates autoresearch's "simplicity criterion."
+
+#### Important caveat
+
+> **These 300 experiments used pre-defined mutation lists, NOT real-time LLM reasoning.** The search didn't adapt based on results. As the EVALUATION_REPORT notes: *"We don't adjust strategy based on results like a real LLM agent would. Our 9-14% keep rate is a conservative lower bound."*
+>
+> This is the gap Phase 3 was designed to close.
+
+> Full analysis: `serve/EVALUATION_REPORT.md` | Raw data: `serve/production/`
+
+---
+
+### Phase 3: Real LLM-Driven Research (Apr 1)
 
 > **Date**: 2026-04-01
 > **Branch**: `autoresearch/apr1` → [zelinewang/autoresearch](https://github.com/zelinewang/autoresearch/tree/autoresearch/apr1)
-> **Method**: Real autoresearch protocol — LLM forms hypothesis, edits train.py, commits, trains 5 min, evaluates, keeps or discards
-> **Purpose**: Fill the gap identified in the 300-round evaluation: "our simulation ≠ real autoresearch — real LLM adjusts strategy based on results"
+> **Goal**: Run the actual autoresearch protocol — LLM reasons in real time, forms hypotheses, adjusts strategy based on results
+> **Key question**: Does LLM reasoning outperform scripted search?
 
-### Context: What Came Before
+Unlike Phases 1–2 which used scripts with pre-defined parameter lists, Phase 3 is the real thing: an LLM (Claude Opus 4.6) autonomously edits `train.py`, commits, trains for 5 minutes, evaluates, keeps or discards, and decides what to try next — exactly as described in `program.md`.
 
-Prior sessions (Mar 31) ran two rounds of systematic experiments:
-- **16 controlled parameter sweeps** (`run_experiments.py`): single-variable analysis of depth, time budget, batch size, LR
-- **300 production experiments** (3 tracks × 100 each): scripted mutation lists — Smart (9% keep), Diverse (11% keep), Random (1% keep)
-
-Those experiments used **pre-defined mutation lists**, not real-time LLM reasoning. The EVALUATION_REPORT explicitly noted this gap: *"We don't adjust strategy based on results like a real LLM agent would."*
-
-**This session closes that gap.** 20 experiments with genuine LLM reasoning — each hypothesis informed by all prior results.
-
-### Setup
+#### Setup
 
 - TIME_BUDGET raised from 120s to 300s (matching GPU protocol) for meaningful signal
 - Baseline established: val_bpb = 2.1709, 121 steps, 3.5M params (DEPTH=2, BATCH=2)
 
-### Experiment Results (20 experiments, 10 keep / 10 discard)
+#### Experiment Results (20 experiments, 10 keep / 10 discard)
 
 ```
 commit   val_bpb   status   description
@@ -237,7 +317,7 @@ c01b4b4  2.026908  keep     MLP expansion 12x→16x
 
 **Final best: val_bpb = 2.027 (−6.6% from baseline 2.171)**
 
-### Comparison with Automated Experiments (Honest Assessment)
+#### Comparison with Automated Experiments (Honest Assessment)
 
 | Metric | Scripted 300-round (Phase 2) | LLM-driven 20-round (Phase 3) |
 |--------|------------------------------|-------------------------------|
@@ -258,14 +338,14 @@ c01b4b4  2.026908  keep     MLP expansion 12x→16x
 
 4. **Some findings overlap**: Both phases independently found that UNEMBEDDING_LR=0.01 helps (Phase 2 Smart #35, Phase 3 experiment #8). Both found DEPTH increase hurts on CPU. This cross-validation strengthens confidence.
 
-### What LLM Reasoning Got Right
+#### What LLM Reasoning Got Right
 
 - **Rapid direction-finding**: First 3 experiments found WARMDOWN_RATIO was the key LR schedule knob
 - **Knowing when to stop**: After WARMDOWN=0.1 failed, immediately reversed to 0.2 instead of continuing to sweep
 - **Creative architectural leaps**: Moving from hyperparameters (boring) to MLP width (novel) after hyperparameters plateaued — scripted experiments can't make this jump
 - **Trend exploitation**: Pushed MLP width through 6x→8x→12x→16x, stopping at 24x when returns diminished
 
-### What LLM Reasoning Got Wrong (Self-Critique)
+#### What LLM Reasoning Got Wrong (Self-Critique)
 
 - **No noise measurement**: Never ran the same experiment twice to quantify variance. Some "keeps" with Δ<0.005 may be noise.
 - **CPU-specific findings**: The "wider MLP is faster on CPU" finding (SIMD vectorization favoring wider matrices) likely **does not transfer to GPU**, where Flash Attention makes depth more efficient.
@@ -273,7 +353,7 @@ c01b4b4  2.026908  keep     MLP expansion 12x→16x
 - **Small absolute improvement**: 2.171→2.027 = 0.144 improvement in 20 rounds. Phase 2 achieved 2.110→2.014 = 0.096 in 100 rounds. Our improvement is larger in absolute terms but started from a different (worse) baseline because we used DEPTH=2 baseline vs Phase 2's optimized starting points.
 - **Late discovery bias**: The MLP width finding came in experiments 15-18 (late session). If we'd explored architecture earlier and hyperparams later, results might have been better.
 
-### Technical Findings (CPU-Specific — Caveats Apply)
+#### Technical Findings (CPU-Specific — Caveats Apply)
 
 These findings are validated in our CPU regime (DEPTH=2, 128-dim, 300s budget). **They may not transfer to GPU with Flash Attention and larger models.**
 
